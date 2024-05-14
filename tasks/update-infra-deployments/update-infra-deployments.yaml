@@ -3,24 +3,21 @@ apiVersion: tekton.dev/v1
 kind: Task
 metadata:
   labels:
-    app.kubernetes.io/version: "0.5.0"
+    app.kubernetes.io/version: "0.5.1"
   annotations:
     tekton.dev/pipelines.minVersion: "0.12.1"
     tekton.dev/tags: "release"
   name: update-infra-deployments
 spec:
   description: |
-   This task clones redhat-appstudio/infra-deployments GH repository.
-   It then runs a script obtained from the infra-deployment-update-script key in data which can modify text files
-   It then generates pull-request for redhat-appstudio/infra-deployments repository using the modified files.
+    This task clones a specified GitHub repository.
+    It then runs a script obtained from the infra-deployment-update-script key in the data file, which can modify text files.
+    It then generates a pull request for the specified repository using the modified files.
   params:
     - name: dataJsonPath
       description: path to data json file
     - name: snapshotPath
       description: path to snapshot json file
-    - name: targetGHRepo
-      description: GitHub repository of the infra-deployments code
-      default: redhat-appstudio/infra-deployments
     - name: gitImage
       description: Image reference containing the git command
       default: >-
@@ -54,8 +51,11 @@ spec:
       workingDir: /shared
       env:
         - name: TARGET_GH_REPO
-          value: "$(params.targetGHRepo)"
+          valueFrom:
+            jsonPath: "$(params.dataJsonPath)"  # Path to the data json file
+            path: ".targetGHRepo"  # Key in the json to retrieve the value
       script: |
+        echo "Cloning $TARGET_GH_REPO"
         git clone "https://github.com/${TARGET_GH_REPO}.git" cloned
     - name: run-update-script
       image: $(params.scriptImage)
@@ -70,8 +70,7 @@ spec:
         cat "$(params.snapshotPath)"
         echo ""
         
-        # we assume we only have one component in the service.
-        #
+        # We assume we only have one component in the service.
         revision=$(cat "$(params.snapshotPath)" | jq -r .components[0].source.git.revision)
         echo "revision: $revision"
         echo $revision > ../revision.txt
@@ -80,7 +79,13 @@ spec:
         echo "origin repo: $originRepo"
         echo $originRepo > ../originRepo.txt
 
-        # get SCRIPT from Data
+        TARGET_GH_REPO=$(cat "$(params.dataJsonPath)" | jq -r '.targetGHRepo')
+        if [ -z "$TARGET_GH_REPO" ]; then
+          echo "Error: 'targetGHRepo' key missing in data file!"
+          exit 1
+        fi
+
+        # Get SCRIPT from Data
         echo "data: $(params.dataJsonPath)"
         SCRIPT=$(cat "$(params.dataJsonPath)" | jq -r '."infra-deployment-update-script" // empty')
 
@@ -124,7 +129,9 @@ spec:
         - name: GITHUB_API_URL
           value: https://api.github.com
         - name: TARGET_GH_REPO
-          value: "$(params.targetGHRepo)"
+          valueFrom:
+            jsonPath: "$(params.dataJsonPath)"  # Path to the data json file
+            path: ".targetGHRepo"  # Key in the json to retrieve the value
       script: |
         #!/usr/bin/env python3
         import json
