@@ -9,6 +9,7 @@ function git() {
     gitRepo=$(echo "$*" | cut -f5 -d/ | cut -f1 -d.)
     mkdir -p "$gitRepo"/schema
     echo '{"$schema": "http://json-schema.org/draft-07/schema#","type": "object", "properties":{}}' > "$gitRepo"/schema/advisory.json
+
   elif [[ "$*" == *"failing-tenant"* ]]; then
     echo "Mocking failing git command" && false
   else
@@ -17,11 +18,60 @@ function git() {
   fi
 }
 
+function find() {
+  echo "Mock find called with: $*" >&2
+
+  if echo "$*" | grep -q "${ADVISORY_BASE_DIR}"; then
+    # Ensuring advisories are returned in descending order for correct processing
+    echo "${ADVISORY_BASE_DIR}/2025/1602/advisory.yaml"  # Contains image-beta
+    echo "${ADVISORY_BASE_DIR}/2025/1601/advisory.yaml"  # Contains image-alpha
+    echo "${ADVISORY_BASE_DIR}/2024/1452/advisory.yaml"
+    echo "${ADVISORY_BASE_DIR}/2024/1442/advisory.yaml"
+  else
+    echo "Error: Unexpected find command: $*" >&2
+    exit 1
+  fi
+}
+
+function cat() {
+  echo "Mock cat called with: $*" >&2
+
+  if [[ -z "$1" ]]; then
+    echo "Error: Empty file path in cat command" >&2
+    exit 1
+  fi
+
+  advisory_path="$1"
+  advisory_year=$(echo "$advisory_path" | awk -F'/' '{print $(NF-2)}')  # Extract Year
+  advisory_num=$(echo "$advisory_path" | awk -F'/' '{print $(NF-1)}')   # Extract Advisory Number
+
+  echo "Returning advisory for ${advisory_year}/${advisory_num}" >&2
+
+  case "$advisory_num" in
+    1601)  # Advisory containing image-alpha
+      echo '{"spec":{"content":{"images":[{"architecture":"amd64","component":"release-manager-alpha","containerImage":"quay.io/example/release@sha256:alpha123","repository":"example-stream/release","signingKey":"example-sign-key","tags":["v1.0","latest"]}]}}}'
+    ;;
+    1602)  # Advisory containing image-beta
+      echo '{"spec":{"content":{"images":[{"architecture":"amd64","component":"release-manager-beta","containerImage":"quay.io/example/release@sha256:beta123","repository":"example-stream/release","signingKey":"example-sign-key","tags":["v2.0","stable"]}]}}}'
+    ;;
+    1442)
+      echo '{"spec":{"content":{"images":[{"architecture":"amd64","component":"foo-foo-manager-1-15","containerImage":"quay.io/example/openstack@sha256:abde","repository":"quay.io/example/openstack","signingKey":"example-sign-key","tags":["v1.0","latest"]}]}}}'
+    ;;
+    1452)
+      echo '{"spec":{"content":{"images":[{"architecture":"amd64","component":"foo-foo-manager-1-15","containerImage":"quay.io/example/openstack@sha256:lmnop","repository":"quay.io/example/openstack","signingKey":"example-sign-key","tags":["latest"]}]}}}'
+    ;;
+    *)
+      echo "Error: Unexpected advisory number $advisory_num" >&2
+      exit 1
+    ;;
+  esac
+}
+
 function glab() {
   echo "Mock glab called with: $*"
 
   if [[ "$*" != "auth login"* ]]; then
-    echo Error: Unexpected call
+    echo "Error: Unexpected call"
     exit 1
   fi
 }
