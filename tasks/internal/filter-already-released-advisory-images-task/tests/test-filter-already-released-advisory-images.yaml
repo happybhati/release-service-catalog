@@ -1,0 +1,79 @@
+---
+apiVersion: tekton.dev/v1
+kind: Pipeline
+metadata:
+  name: test-filter-already-released-advisory-images-task
+spec:
+  params: []
+  workspaces:
+    - name: tests-workspace
+  tasks:
+    - name: run-filter-task
+      taskRef:
+        name: filter-already-released-advisory-images-task
+      workspaces:
+        - name: data
+          workspace: tests-workspace
+      params:
+        - name: snapshot_json
+          value: |
+            {
+              "application": "myapp",
+              "components": [
+                {
+                  "name": "comp1",
+                  "repository": "quay.io/redhat-prod/repo",
+                  "containerImage": "quay.io/redhat-prod/repo@sha256:123",
+                  "tags": ["v1.0", "latest"]
+                },
+                {
+                  "name": "comp2",
+                  "repository": "quay.io/redhat-prod/repo",
+                  "containerImage": "quay.io/redhat-prod/repo@sha256:456",
+                  "tags": ["v2.0"]
+                }
+              ]
+            }
+        - name: origin
+          value: "dev-tenant"
+        - name: advisory_secret_name
+          value: "dummy-secret"
+        - name: internalRequestPipelineRunName
+          value: "$(context.pipelineRun.uid)"
+
+    - name: validate-filtered-result
+      runAfter:
+        - run-filter-task
+      taskSpec:
+        params:
+          - name: filtered_snapshot
+            type: string
+          - name: result
+            type: string
+        steps:
+          - name: check-filtering
+            image: quay.io/konflux-ci/release-service-utils:26e22ecf2c23e7ec8134fede3b40a6e6aef8ac20
+            script: |
+              #!/usr/bin/env bash
+              set -eux
+
+              if [[ "$(params.result)" != "Success" ]]; then
+                echo "Task did not succeed: $(params.result)"
+                exit 1
+              fi
+
+              echo "Filtered Snapshot Content:"
+              echo '$(params.filtered_snapshot)' | jq .
+
+              # Expect only 1 component left after filtering
+              component_count=$(echo '$(params.filtered_snapshot)' | jq '.components | length')
+
+              if [[ "$component_count" -ne 1 ]]; then
+                echo "Expected 1 component remaining after filtering, found $component_count"
+                exit 1
+              fi
+      params:
+        - name: filtered_snapshot
+          value: "$(tasks.run-filter-task.results.filtered_snapshot)"
+        - name: result
+          value: "$(tasks.run-filter-task.results.result)"
