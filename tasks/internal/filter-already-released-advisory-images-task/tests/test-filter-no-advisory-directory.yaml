@@ -1,0 +1,67 @@
+---
+apiVersion: tekton.dev/v1
+kind: Pipeline
+metadata:
+  name: test-filter-no-advisory-directory
+spec:
+  description: |
+    Test the task when the advisory directory for the given origin does not exist.
+    Expected behavior: original snapshot is returned unchanged.
+  workspaces:
+    - name: tests-workspace
+  tasks:
+    - name: run-filter-task
+      taskRef:
+        name: filter-already-released-advisory-images-task
+      params:
+        - name: snapshot_json
+          value: >-
+            {\"components\":[
+              {\"name\":\"test-component\",\"version\":\"1.0.0\",\"containerImage\":\"quay.io/test/image:1.0.0\",\"tags\":[\"v1.0\"],\"repository\":\"quay.io/test\"}
+            ]}
+        - name: origin
+          value: "not-existing-origin"
+        - name: advisory_secret_name
+          value: "filter-already-released-advisory-images-secret"
+        - name: internalRequestPipelineRunName
+          value: "$(context.pipelineRun.name)"
+      workspaces:
+        - name: data
+          workspace: tests-workspace
+    - name: validate-result
+      runAfter:
+        - run-filter-task
+      params:
+        - name: filtered_snapshot
+          value: "$(tasks.run-filter-task.results.filtered_snapshot)"
+        - name: result
+          value: "$(tasks.run-filter-task.results.result)"
+      taskSpec:
+        params:
+          - name: filtered_snapshot
+            type: string
+          - name: result
+            type: string
+        steps:
+          - name: validate
+            image: quay.io/konflux-ci/release-service-utils:26e22ecf2c23e7ec8134fede3b40a6e6aef8ac20
+            script: |
+              #!/usr/bin/env bash
+              set -eux
+
+              echo "Validating task result when advisory directory does not exist..."
+              [[ "$(params.result)" == "Success" ]]
+
+              COMPONENTS_COUNT=$(echo '$(params.filtered_snapshot)' | jq '.components | length')
+              if [[ "$COMPONENTS_COUNT" -ne 1 ]]; then
+                echo "Expected 1 component, got $COMPONENTS_COUNT"
+                exit 1
+              fi
+
+              IMAGE=$(echo '$(params.filtered_snapshot)' | jq -r '.components[0].containerImage')
+              if [[ "$IMAGE" != "quay.io/test/image:1.0.0" ]]; then
+                echo "Unexpected image: $IMAGE"
+                exit 1
+              fi
+
+              echo "Validation successful for advisory directory absence!"
