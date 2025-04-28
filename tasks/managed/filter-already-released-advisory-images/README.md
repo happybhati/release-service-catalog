@@ -1,6 +1,6 @@
 # Filter Already Released Advisory Images
 
-This task filters out images from a snapshot that have already been published in advisories.  
+This task filters out the images from a snapshot that have already been published in advisories.  
 It is a **managed Tekton task** that triggers an **internal task** using an InternalRequest, and returns a filtered snapshot JSON containing only **unpublished images**.
 
 ## Parameters
