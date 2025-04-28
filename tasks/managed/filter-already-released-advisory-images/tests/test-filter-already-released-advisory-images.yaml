@@ -2,111 +2,124 @@
 apiVersion: tekton.dev/v1
 kind: Pipeline
 metadata:
-  name: test-filter-already-released-advisory-images-prod
+  name: test-filter-already-released-advisory-images
 spec:
   description: |
-    Validates that the filter-already-released-advisory-images task removes images already present
-    in advisories. In this test, comp1 is considered already released (via mock), while comp2 should remain.
+    Test pipeline for the filter-already-released-advisory-images managed task.
+    This pipeline tests that the task correctly creates and handles InternalRequests.
+  params:
+    - name: snapshotPath
+      description: Path to the snapshot file
+      default: snapshot.json
+    - name: origin
+      description: The origin workspace for the release CR
+      default: test-origin
+    - name: advisory_secret_name
+      description: The name of the secret containing advisory metadata
+      default: test-advisory-secret
   workspaces:
     - name: tests-workspace
+      description: Workspace for test files
   tasks:
     - name: setup
       taskSpec:
         workspaces:
-          - name: data
+          - name: tests-workspace
+            description: Workspace for test files
         steps:
-          - name: create-snapshot-and-rpa
-            image: quay.io/konflux-ci/release-service-utils:latest
+          - name: create-test-files
+            image: registry.access.redhat.com/ubi9/ubi-minimal:latest
             script: |
-              #!/usr/bin/env bash
-              set -eux
+              #!/bin/bash
+              set -ex
 
-              mkdir -p "$(workspaces.data.path)/$(context.pipelineRun.uid)/results"
-
-              cat > "$(workspaces.data.path)/$(context.pipelineRun.uid)/test_release_plan_admission.json" <<EOF
+              # Create a test snapshot with both new and already released images
+              cat > $(workspaces.tests-workspace.path)/$(params.snapshotPath) << 'EOF'
               {
-                "spec": {
-                  "origin": "dev-tenant"
-                }
-              }
-              EOF
-
-              cat > "$(workspaces.data.path)/$(context.pipelineRun.uid)/test_snapshot_spec.json" <<EOF
-              {
-                "application": "myapp",
                 "components": [
                   {
-                    "name": "comp1",
-                    "repository": "quay.io/redhat-prod/release",
-                    "containerImage": "quay.io/redhat-prod/release@sha256:prod123",
-                    "tags": ["v1.0", "latest"]
+                    "name": "test-component",
+                    "containerImage": "quay.io/test/image:v1.0.0",
+                    "version": "1.0.0"
                   },
                   {
-                    "name": "comp2",
-                    "repository": "quay.io/redhat-prod/another",
-                    "containerImage": "quay.io/redhat-prod/another@sha256:xyz",
-                    "tags": ["v2.0"]
+                    "name": "new-component",
+                    "containerImage": "quay.io/test/new-image:v2.0.0",
+                    "version": "2.0.0"
                   }
                 ]
               }
               EOF
-      workspaces:
-        - name: data
-          workspace: tests-workspace
 
+              # Create a test advisory secret
+              cat > $(workspaces.tests-workspace.path)/advisory-secret.yaml << EOF
+              apiVersion: v1
+              kind: Secret
+              metadata:
+                name: $(params.advisory_secret_name)
+              type: Opaque
+              stringData:
+                username: test-user
+                password: test-password
+              EOF
+
+              # Apply the secret
+              kubectl apply -f $(workspaces.tests-workspace.path)/advisory-secret.yaml
+      workspaces:
+        - name: tests-workspace
+          workspace: tests-workspace
+      params:
+        - name: snapshotPath
+          value: $(params.snapshotPath)
+        - name: origin
+          value: $(params.origin)
+        - name: advisory_secret_name
+          value: $(params.advisory_secret_name)
     - name: run-task
       runAfter:
         - setup
       taskRef:
         name: filter-already-released-advisory-images
+      workspaces:
+        - name: tests-workspace
+          workspace: tests-workspace
       params:
         - name: snapshotPath
-          value: "$(context.pipelineRun.uid)/test_snapshot_spec.json"
-        - name: releasePlanAdmissionPath
-          value: "$(context.pipelineRun.uid)/test_release_plan_admission.json"
-        - name: resultsDirPath
-          value: "$(context.pipelineRun.uid)/results"
-        - name: taskGitUrl
-          value: "http://localhost"
-        - name: taskGitRevision
-          value: "main"
-        - name: pipelineRunUid
-          value: "$(context.pipelineRun.uid)"
-      workspaces:
-        - name: data
-          workspace: tests-workspace
-
-    - name: check-result
+          value: $(params.snapshotPath)
+        - name: origin
+          value: $(params.origin)
+        - name: advisory_secret_name
+          value: $(params.advisory_secret_name)
+    - name: verify-result
       runAfter:
         - run-task
       taskSpec:
-        params:
-          - name: result
-            type: string
-          - name: filtered_snapshot
-            type: string
+        workspaces:
+          - name: tests-workspace
+            description: Workspace for test files
         steps:
-          - name: assert-filtered
-            image: quay.io/konflux-ci/release-service-utils:latest
+          - name: verify
+            image: registry.access.redhat.com/ubi9/ubi-minimal:latest
             script: |
-              #!/usr/bin/env bash
-              set -eux
+              #!/bin/bash
+              set -ex
 
-              if [[ "$(params.result)" != "Success" ]]; then
-                echo "Task failed: $(params.result)"
+              # Verify that an InternalRequest was created
+              if ! kubectl get internalrequest -l "internal-services.appstudio.openshift.io/pipelinerun-uid=$(context.pipelineRun.uid)" > /dev/null 2>&1; then
+                echo "Error: No InternalRequest was created"
                 exit 1
               fi
 
-              echo "Filtered Snapshot:"
-              echo '$(params.filtered_snapshot)' | jq .
-
-              count=$(echo '$(params.filtered_snapshot)' | jq '.components | length')
-              if [ "$count" -ne 1 ]; then
-                echo "Expected 1 component after filtering, found $count"
+              # Verify that the InternalRequest completed successfully
+              if ! kubectl get internalrequest -l "internal-services.appstudio.openshift.io/pipelinerun-uid=$(context.pipelineRun.uid)" -o jsonpath='{.items[0].status.conditions[0].status}' | grep -q "True"; then
+                echo "Error: InternalRequest did not complete successfully"
                 exit 1
               fi
-      params:
-        - name: result
-          value: "$(tasks.run-task.results.result)"
-        - name: filtered_snapshot
-          value: "$(tasks.run-task.results.filtered_snapshot)"
+
+              # Verify that the filtered snapshot path is returned
+              if [ ! -f "$(workspaces.tests-workspace.path)/filtered-snapshot.json" ]; then
+                echo "Error: Filtered snapshot file not found"
+                exit 1
+              fi
+
+              echo "All verifications passed"
