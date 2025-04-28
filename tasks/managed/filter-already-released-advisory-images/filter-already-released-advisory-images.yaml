@@ -25,6 +25,7 @@ spec:
     - name: dataDir
       type: string
       description: The location where data will be stored
+      default: $(workspaces.data.path)
     - name: request
       type: string
       description: Type of request to be created
@@ -82,7 +83,7 @@ spec:
             exit 1
         fi
 
-        pipelinerun_label="appstudio.openshift.io/pipelinerun"
+        pipelinerun_label="internal-services.appstudio.openshift.io/pipelinerun-uid"
 
         # Determine advisory_secret_name based on repositories in snapshot
         pending_repositories=$(jq -r '.components[] | select(.repository |
