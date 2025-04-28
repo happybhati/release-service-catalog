@@ -68,6 +68,8 @@ spec:
           value: "$(context.pipelineRun.uid)/test_release_plan_admission.json"
         - name: resultsDirPath
           value: "$(context.pipelineRun.uid)/results"
+        - name: dataDir
+          value: "$(workspaces.data.path)"
         - name: taskGitUrl
           value: "http://localhost"
         - name: taskGitRevision
