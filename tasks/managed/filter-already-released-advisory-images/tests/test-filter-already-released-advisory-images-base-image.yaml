@@ -10,6 +10,10 @@ spec:
     image and should remain in the snapshot despite being in an advisory.
   workspaces:
     - name: tests-workspace
+  params:
+    - name: dataDir
+      type: string
+      description: The location where data will be stored
   tasks:
     - name: setup
       taskSpec:
@@ -69,7 +73,7 @@ spec:
         - name: resultsDirPath
           value: "$(context.pipelineRun.uid)/results"
         - name: dataDir
-          value: "$(workspaces.data.path)"
+          value: "$(params.dataDir)"
         - name: taskGitUrl
           value: "http://localhost"
         - name: taskGitRevision

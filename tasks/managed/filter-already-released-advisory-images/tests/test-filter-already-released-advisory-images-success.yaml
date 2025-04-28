@@ -10,6 +10,10 @@ spec:
     released (via mock), while comp2 should remain.
   workspaces:
     - name: tests-workspace
+  params:
+    - name: dataDir
+      type: string
+      description: The location where data will be stored
   tasks:
     - name: setup
       taskSpec:
@@ -68,7 +72,7 @@ spec:
         - name: resultsDirPath
           value: "$(context.pipelineRun.uid)/results"
         - name: dataDir
-          value: "$(workspaces.data.path)"
+          value: "$(params.dataDir)"
         - name: taskGitUrl
           value: "http://localhost"
         - name: taskGitRevision
