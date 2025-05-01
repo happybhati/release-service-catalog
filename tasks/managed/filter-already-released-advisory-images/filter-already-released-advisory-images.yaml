@@ -197,6 +197,7 @@ spec:
 
         echo "Creating internal request for filtering already-released advisory images..."
 
+        # Create internal request and capture both stdout and stderr
         internal-request --pipeline "$(params.request)" \
                          -p snapshot_json="$snapshot" \
                          -p origin="$origin" \
@@ -207,11 +208,22 @@ spec:
                          -s "$(params.synchronously)" \
                          -l ${task_label}="${task_id}" \
                          -l ${pipelinerun_label}="$(params.pipelineRunUid)" \
-                         > "$IR_FILE" || exit 1
+                         2>&1 | tee "$IR_FILE" || {
+            echo "Failed to create internal request. Output:"
+            cat "$IR_FILE"
+            exit 1
+        }
 
+        # Check if the output file exists and has content
+        if [ ! -s "$IR_FILE" ]; then
+            echo "Internal request output file is empty"
+            exit 1
+        fi
+
+        # Extract internal request ID
         internalRequest=$(awk -F"'" '/created/ { print $2 }' "$IR_FILE")
         if [ -z "$internalRequest" ]; then
-            echo "Failed to create internal request"
+            echo "Failed to extract internal request ID. Output:"
             cat "$IR_FILE"
             exit 1
         fi
@@ -220,22 +232,26 @@ spec:
         # Wait for the internal request to complete
         echo "Waiting for internal request to complete..."
         kubectl wait --for=condition=Succeeded internalrequest/"${internalRequest}" --timeout=5m || {
-            echo "Internal request failed or timed out"
+            echo "Internal request failed or timed out. Status:"
             kubectl get internalrequest/"${internalRequest}" -o yaml
+            echo "Internal request logs:"
+            kubectl logs -l "internal-services.appstudio.openshift.io/internal-request=${internalRequest}" --all-containers
             exit 1
         }
 
         # Get the results
         results=$(kubectl get internalrequest "$internalRequest" -o=jsonpath='{.status.results}')
         if [ -z "$results" ]; then
-            echo "No results found in internal request"
+            echo "No results found in internal request. Status:"
+            kubectl get internalrequest/"${internalRequest}" -o yaml
             exit 1
         fi
 
         # Extract the filtered snapshot
         filtered_snapshot=$(echo "$results" | jq -r '.filtered_snapshot // empty')
         if [ -z "$filtered_snapshot" ]; then
-            echo "No filtered snapshot found in results"
+            echo "No filtered snapshot found in results. Results:"
+            echo "$results"
             exit 1
         fi
 
