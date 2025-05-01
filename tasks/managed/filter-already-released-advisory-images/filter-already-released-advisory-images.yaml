@@ -72,7 +72,6 @@ spec:
       description: Success or failure result
     - name: filtered_snapshot
       description: Snapshot JSON with only unpublished images
-
     - description: Produced trusted data artifact
       name: sourceDataArtifact
       type: string
