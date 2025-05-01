@@ -25,7 +25,7 @@ spec:
     - name: request
       type: string
       description: Type of request to be created
-      default: "filter-already-released-advisory-images-task"
+      default: "filter-already-released-advisory-images"
     - name: ociStorage
       description: The OCI repository where the Trusted Artifacts are stored.
       type: string
