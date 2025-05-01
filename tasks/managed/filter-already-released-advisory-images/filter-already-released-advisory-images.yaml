@@ -207,51 +207,42 @@ spec:
                          -s "$(params.synchronously)" \
                          -l ${task_label}="${task_id}" \
                          -l ${pipelinerun_label}="$(params.pipelineRunUid)" \
-                         > "$IR_FILE" || \
-                         (grep "^\[" "$IR_FILE" | jq . && exit 1)
-
-        if [ ! -s "$IR_FILE" ]; then
-            echo "Internal request result file is empty"
-            exit 1
-        fi
+                         > "$IR_FILE" || exit 1
 
         internalRequest=$(awk -F"'" '/created/ { print $2 }' "$IR_FILE")
         if [ -z "$internalRequest" ]; then
-            echo "Failed to extract internal request ID from result"
+            echo "Failed to create internal request"
             cat "$IR_FILE"
             exit 1
         fi
-        echo "done (InternalRequest: ${internalRequest})"
+        echo "Internal request created: ${internalRequest}"
 
+        # Wait for the internal request to complete
+        echo "Waiting for internal request to complete..."
+        kubectl wait --for=condition=Succeeded internalrequest/"${internalRequest}" --timeout=5m || {
+            echo "Internal request failed or timed out"
+            kubectl get internalrequest/"${internalRequest}" -o yaml
+            exit 1
+        }
+
+        # Get the results
         results=$(kubectl get internalrequest "$internalRequest" -o=jsonpath='{.status.results}')
         if [ -z "$results" ]; then
-            echo "Failed to get internal request results"
+            echo "No results found in internal request"
             exit 1
         fi
 
-        internalRequestPipelineRunName="$(jq -jr '.internalRequestPipelineRunName // ""' <<< "${results}")"
-        internalRequestTaskRunName="$(jq -jr '.internalRequestTaskRunName // ""' <<< "${results}")"
-
-        echo "** internalRequestPipelineRunName: ${internalRequestPipelineRunName}"
-        echo "** internalRequestTaskRunName: ${internalRequestTaskRunName}"
-
-        if [[ "$(echo "$results" | jq -r '.result')" == "Success" ]]; then
-          echo "Image filtering successful."
-        else
-          echo "Filtering failed."
-          echo "$results"
-          exit 1
-        fi
-
-        FILTERED_SNAPSHOT=$(echo "$results" | jq -r '.filtered_snapshot // ""')
-        if [ -z "$FILTERED_SNAPSHOT" ]; then
-            echo "Failed to extract filtered snapshot from results"
+        # Extract the filtered snapshot
+        filtered_snapshot=$(echo "$results" | jq -r '.filtered_snapshot // empty')
+        if [ -z "$filtered_snapshot" ]; then
+            echo "No filtered snapshot found in results"
             exit 1
         fi
 
-        echo -n "$FILTERED_SNAPSHOT" > "$(results.filtered_snapshot.path)"
-        echo -n "Success" > "$(results.result.path)"
-        jq -n --arg snapshot "$FILTERED_SNAPSHOT" '{"filtered_snapshot": $snapshot}' | tee "$RESULTS_FILE"
+        # Save the filtered snapshot
+        echo "$filtered_snapshot" > "$(results.filtered_snapshot.path)"
+        echo "Success" > "$(results.result.path)"
+        jq -n --arg snapshot "$filtered_snapshot" '{"filtered_snapshot": $snapshot}' | tee "$RESULTS_FILE"
     - name: create-trusted-artifact
       ref:
         resolver: "git"
