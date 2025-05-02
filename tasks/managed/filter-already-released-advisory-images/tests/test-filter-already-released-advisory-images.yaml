@@ -254,7 +254,7 @@ spec:
               fi
 
               # Check that the filtered snapshot contains only the new component
-              filteredSnapshot=$(echo "$internalRequest" | jq -r '.spec.params.filtered_snapshot')
+              filteredSnapshot=$(jq -r '.filtered_snapshot' "$(params.dataDir)/$(context.pipelineRun.uid)/results/filter-already-released-advisory-images-results.json")
               if [ "$(jq -r '.components | length' <<< "$filteredSnapshot")" != "1" ]; then
                 echo "Filtered snapshot should contain only one component"
                 exit 1
