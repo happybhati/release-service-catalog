@@ -152,10 +152,15 @@ spec:
         task_label="internal-services.appstudio.openshift.io/group-id"
         task_id=$(context.taskRun.uid)
 
-        pending_repositories=$(jq -r '.components[] | select(.repository | contains("quay.io/redhat-pending/")) | .repository' "$SNAPSHOT_FILE")
-        prod_repositories=$(jq -r '.components[] | select(.repository | contains("quay.io/redhat-prod/")) | .repository' "$SNAPSHOT_FILE")
-        orphan_repositories=$(jq -r '.components[] | select(.repository | contains("quay.io/redhat-prod/") | not) | select(.repository | contains("quay.io/redhat-pending/") | not) | .repository' "$SNAPSHOT_FILE")
-
+        # Determine advisory_secret_name based on repositories in snapshot
+        pending_repositories=$(jq -r '.components[] | select(.repository |
+          contains("quay.io/redhat-pending/")) |
+          .repository' "$SNAPSHOT_FILE")
+        prod_repositories=$(jq -r '.components[] | select(.repository | contains("quay.io/redhat-prod/")) |
+          .repository' "$SNAPSHOT_FILE")
+        orphan_repositories=$(jq -r '.components[] | select(.repository | contains("quay.io/redhat-prod/") |
+          not) | select(.repository | contains("quay.io/redhat-pending/") | not) |
+          .repository' "$SNAPSHOT_FILE")
         foundPendingRepositories=false
         [ -n "${pending_repositories}" ] && foundPendingRepositories=true
         foundProdRepositories=false
