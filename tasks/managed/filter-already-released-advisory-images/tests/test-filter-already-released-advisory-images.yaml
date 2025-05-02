@@ -216,7 +216,7 @@ spec:
 
               # Check if the 'pipelineRef' field contains the correct pipeline path
               if [[ "$(echo "$internalRequest" | jq -r '.spec.pipeline.pipelineRef.params[2].value' )" != \
-              "pipelines/internal/filter-already-released-advisory-images-task/filter-already-released-advisory-images-task.yaml" ]]; then
+              "pipelines/internal/filter-already-released-advisory-images/filter-already-released-advisory-images.yaml" ]]; then
                 echo "InternalRequest doesn't contain the correct pipeline path"
                 exit 1
               fi
