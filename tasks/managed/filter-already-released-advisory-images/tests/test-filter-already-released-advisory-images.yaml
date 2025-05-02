@@ -271,9 +271,7 @@ spec:
               fi
 
               # Check that the filtered snapshot was properly added to the results file
-              if [ "$(jq -r '.filtered_snapshot.components[0].name' \
-                "$(params.dataDir)/$(context.pipelineRun.uid)/results/filter-already-released-advisory-images-results.json")" != \
-                "new-component" ]; then
+              if [ "$(jq -r '.components[0].name' <<< "$filteredSnapshot")" != "new-component" ]; then
                 echo "Results file has incorrect filtered snapshot"
                 exit 1
               fi
