@@ -1,0 +1,139 @@
+# Email Reporting Configuration
+# =============================
+
+# AI Configuration
+ai:
+  model: "meta-llama/llama-3-8b-instruct"
+  temperature: 0.3
+  max_tokens: 2500
+  max_commits_for_analysis: 30
+
+# Email Configuration
+email:
+  # SMTP Settings
+  smtp_server: "smtp.gmail.com"
+  smtp_port: 587
+  smtp_username: ""  # Set via environment variable
+  smtp_password: ""  # Set via environment variable
+  
+  # Email Content
+  from_address: "release-reports@konflux-ci.com"
+  to_addresses: []  # Set via environment variable EMAIL_TO
+  
+  # Subject line templates
+  subject_templates:
+    development_to_staging: "Release Service Catalog - Development to Staging Promotion Report"
+    staging_to_production: "Release Service Catalog - Staging to Production Promotion Report"
+    weekly_summary: "Release Service Catalog - Weekly Promotion Summary"
+
+# Report Configuration
+report:
+  # Output settings
+  save_reports: true
+  report_directory: "promotion_reports"
+  retention_days: 30
+  
+  # Content settings
+  include_commit_links: true
+  include_task_analysis: true
+  include_pipeline_impact: true
+  include_statistics: true
+  
+  # AI Summary settings
+  summary_sections:
+    - "🚀 New Features & Enhancements"
+    - "🐛 Bug Fixes & Improvements"
+    - "🛠 Refactoring & Technical Debt"
+    - "🧪 Testing & Quality Assurance"
+    - "🔧 Infrastructure & Configuration"
+
+# Repository Configuration
+repository:
+  url: "https://github.com/konflux-ci/release-service-catalog"
+  branches:
+    development: "development"
+    staging: "staging"
+    production: "production"
+
+# Task Analysis Configuration
+task_analysis:
+  # Task folder patterns to analyze
+  task_folders:
+    - "managed"
+    - "tenant"
+    - "internal"
+    - "collectors"
+  
+  # Pipeline folders to scan
+  pipeline_folders:
+    - "run-collectors"
+    - "managed"
+    - "tenant"
+    - "internal"
+  
+  # File patterns to match
+  task_file_pattern: "tasks/([^/]+)/([^/]+)/[^/]+\\.yaml"
+  pipeline_file_pattern: ".*\\.yaml"
+
+# GitHub Integration
+github:
+  # Create releases for production promotions
+  create_releases: true
+  release_title_template: "Production Release - {date}"
+  release_notes_template: "Automated production release with detailed change report"
+  
+  # Upload artifacts
+  upload_artifacts: true
+  artifact_retention_days: 30
+
+# Scheduling Configuration
+scheduling:
+  # Weekly promotion schedule (Wednesday)
+  weekly_promotion_day: 3  # 1=Monday, 3=Wednesday, 7=Sunday
+  weekly_promotion_time: "10:00"  # UTC time
+  
+  # Timezone for date calculations
+  timezone: "UTC"
+
+# Notification Configuration
+notifications:
+  # Slack integration (optional)
+  slack:
+    enabled: false
+    webhook_url: ""
+    channel: "#releases"
+  
+  # Microsoft Teams integration (optional)
+  teams:
+    enabled: false
+    webhook_url: ""
+  
+  # Discord integration (optional)
+  discord:
+    enabled: false
+    webhook_url: ""
+    channel: "releases"
+
+# Error Handling
+error_handling:
+  # Continue on non-critical errors
+  continue_on_errors: true
+  
+  # Retry failed operations
+  max_retries: 3
+  retry_delay: 5  # seconds
+  
+  # Logging level
+  log_level: "INFO"  # DEBUG, INFO, WARNING, ERROR
+
+# Performance Configuration
+performance:
+  # Parallel processing
+  max_parallel_commits: 10
+  
+  # Cache settings
+  enable_caching: true
+  cache_duration: 3600  # seconds
+  
+  # Memory limits
+  max_memory_usage: "512MB" 
