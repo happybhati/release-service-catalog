@@ -63,6 +63,23 @@ spec:
       # to avoid tar extraction errors, we need to specify a subdirectory
       # inside the volume.
       default: "/var/workdir/release"
+    # Smart Failure Analyzer params
+    - name: llmEndpoint
+      type: string
+      description: "OpenAI-compatible LLM endpoint for AI failure analysis. Empty = skip."
+      default: ""
+    - name: llmModel
+      type: string
+      description: "LLM model to use for analysis"
+      default: "gemini-2.0-flash"
+    - name: llmApiKeySecretName
+      type: string
+      description: "K8s Secret name containing LLM API key (key: api-key)"
+      default: "smart-analyzer-llm"
+    - name: slackWebhookSecretName
+      type: string
+      description: "K8s Secret name containing Slack webhook URL (key: webhook-url)"
+      default: "smart-analyzer-slack"
   tasks:
     - name: verify-access-to-resources
       taskRef:
@@ -453,3 +470,33 @@ spec:
             value: tasks/managed/update-cr-status/update-cr-status.yaml
       runAfter:
         - push-snapshot
+  # Smart Failure Analyzer - AI-powered pipeline failure diagnosis
+  # Runs after ALL tasks complete (success or failure)
+  finally:
+    - name: smart-failure-analyzer
+      taskRef:
+        resolver: "git"
+        params:
+          - name: url
+            value: $(params.taskGitUrl)
+          - name: revision
+            value: $(params.taskGitRevision)
+          - name: pathInRepo
+            value: tasks/managed/smart-failure-analyzer/smart-failure-analyzer.yaml
+      params:
+        - name: PIPELINE_RUN_NAME
+          value: "$(context.pipelineRun.name)"
+        - name: PIPELINE_NAME
+          value: "$(context.pipeline.name)"
+        - name: NAMESPACE
+          value: "$(context.pipelineRun.namespace)"
+        - name: AGGREGATE_STATUS
+          value: "$(tasks.status)"
+        - name: LLM_ENDPOINT
+          value: "$(params.llmEndpoint)"
+        - name: LLM_MODEL
+          value: "$(params.llmModel)"
+        - name: LLM_API_KEY_SECRET_NAME
+          value: "$(params.llmApiKeySecretName)"
+        - name: SLACK_WEBHOOK_SECRET_NAME
+          value: "$(params.slackWebhookSecretName)"

@@ -1,0 +1,627 @@
+apiVersion: tekton.dev/v1
+kind: Task
+metadata:
+  name: smart-failure-analyzer
+  labels:
+    app.kubernetes.io/name: smart-failure-analyzer
+    app.kubernetes.io/version: "2.0"
+  annotations:
+    tekton.dev/displayName: "Smart Failure Analyzer"
+    tekton.dev/categories: "Monitoring, Debugging"
+    description: |
+      Production-grade pipeline failure analyzer. Drop into any pipeline's
+      finally block. Collects all context, classifies the failure, calls an
+      LLM for remediation, and posts results to Slack.
+spec:
+  description: >-
+    Generic pipeline failure analyzer. Works with ANY Tekton pipeline.
+    Collects TaskRun data, classifies failure, generates LLM-ready report,
+    optionally queries an LLM and posts to Slack.
+  params:
+    - name: PIPELINE_RUN_NAME
+      type: string
+      description: "Use $(context.pipelineRun.name)"
+    - name: PIPELINE_NAME
+      type: string
+      default: ""
+      description: "Use $(context.pipeline.name)"
+    - name: NAMESPACE
+      type: string
+      default: "default"
+      description: "Use $(context.pipelineRun.namespace)"
+    - name: AGGREGATE_STATUS
+      type: string
+      default: "None"
+      description: "Use $(tasks.status)"
+    - name: LLM_ENDPOINT
+      type: string
+      default: ""
+      description: "OpenAI-compatible API endpoint. Empty = skip LLM."
+    - name: LLM_MODEL
+      type: string
+      default: "gpt-4"
+    - name: LLM_API_KEY_SECRET_NAME
+      type: string
+      default: "smart-analyzer-llm"
+      description: "K8s Secret name with key 'api-key'. Create with: kubectl create secret generic smart-analyzer-llm --from-literal=api-key=sk-..."
+    - name: SLACK_WEBHOOK_SECRET_NAME
+      type: string
+      default: "smart-analyzer-slack"
+      description: "K8s Secret name with key 'webhook-url'. Create with: kubectl create secret generic smart-analyzer-slack --from-literal=webhook-url=https://hooks.slack.com/..."
+    - name: SLACK_CHANNEL
+      type: string
+      default: ""
+      description: "Slack channel override (optional, uses webhook default)"
+    - name: LOG_LINES
+      type: string
+      default: "100"
+  results:
+    - name: FAILURE_CATEGORY
+      description: "oom | timeout | build-error | auth | infra | resource-quota | config | test-failure | unknown | none"
+    - name: FAILED_TASK
+      description: "Name of the failed task (or 'none')"
+    - name: SUMMARY
+      description: "One-line summary of the failure"
+  steps:
+    # ════════════════════════════════════════════════════════════════
+    # STEP 1: COLLECT + CLASSIFY + REPORT + WRITE RESULTS
+    # One step does the core work — reliable, no inter-step issues
+    # ════════════════════════════════════════════════════════════════
+    - name: analyze
+      image: bitnami/kubectl:latest
+      env:
+        - name: PR_NAME
+          value: "$(params.PIPELINE_RUN_NAME)"
+        - name: PL_NAME
+          value: "$(params.PIPELINE_NAME)"
+        - name: NS
+          value: "$(params.NAMESPACE)"
+        - name: AGG_STATUS
+          value: "$(params.AGGREGATE_STATUS)"
+        - name: LOG_LINES
+          value: "$(params.LOG_LINES)"
+      script: |
+        #!/bin/bash
+        set -uo pipefail
+
+        # ── Paths for Tekton results (keep small — 4K limit total) ──
+        RESULT_CATEGORY="$(results.FAILURE_CATEGORY.path)"
+        RESULT_FAILED_TASK="$(results.FAILED_TASK.path)"
+        RESULT_SUMMARY="$(results.SUMMARY.path)"
+
+        # Shared dir for the LLM/Slack step
+        SHARE="/workspace/share"
+        mkdir -p "$SHARE"
+
+        NOW=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+        echo "╔══════════════════════════════════════════════════════════════════╗"
+        echo "║  SMART FAILURE ANALYZER v2.0                                    ║"
+        echo "╠══════════════════════════════════════════════════════════════════╣"
+        echo "║  PipelineRun : $PR_NAME"
+        echo "║  Pipeline    : $PL_NAME"
+        echo "║  Namespace   : $NS"
+        echo "║  Status      : $AGG_STATUS"
+        echo "║  Time        : $NOW"
+        echo "╚══════════════════════════════════════════════════════════════════╝"
+        echo ""
+
+        # ═══════════════════════════════════════════════════════════
+        # 1. COLLECT — all TaskRun data from Kubernetes API
+        # ═══════════════════════════════════════════════════════════
+        echo "=== [1/4] Collecting TaskRun Data ==="
+
+        TASKRUN_NAMES=$(kubectl get taskruns -n "$NS" \
+          -l "tekton.dev/pipelineRun=$PR_NAME" \
+          -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' 2>/dev/null)
+
+        TASK_COUNT=$(echo "$TASKRUN_NAMES" | grep -c . 2>/dev/null || echo 0)
+        echo "Found $TASK_COUNT TaskRun(s)"
+        echo ""
+
+        TASKS_TABLE=""
+        FAILED_TASK=""
+        FAILED_EXIT=""
+        FAILED_LOGS=""
+        FAILED_RESOURCES=""
+        FAILED_EVENTS=""
+        FAILED_POD_STATUS=""
+
+        while IFS= read -r TASKRUN; do
+          [ -z "$TASKRUN" ] && continue
+
+          TLABEL=$(kubectl get taskrun "$TASKRUN" -n "$NS" \
+            -o jsonpath='{.metadata.labels.tekton\.dev/pipelineTask}' 2>/dev/null)
+          [ -z "$TLABEL" ] && TLABEL="$TASKRUN"
+
+          # Skip self
+          [ "$TLABEL" = "analyze-failure" ] && continue
+
+          TSTATUS=$(kubectl get taskrun "$TASKRUN" -n "$NS" \
+            -o jsonpath='{.status.conditions[0].reason}' 2>/dev/null)
+          TMSG=$(kubectl get taskrun "$TASKRUN" -n "$NS" \
+            -o jsonpath='{.status.conditions[0].message}' 2>/dev/null)
+          TEXIT=$(kubectl get taskrun "$TASKRUN" -n "$NS" \
+            -o jsonpath='{.status.steps[0].terminated.exitCode}' 2>/dev/null)
+          [ -z "$TEXIT" ] && TEXIT="-"
+          TSTART=$(kubectl get taskrun "$TASKRUN" -n "$NS" \
+            -o jsonpath='{.status.startTime}' 2>/dev/null)
+          TCOMP=$(kubectl get taskrun "$TASKRUN" -n "$NS" \
+            -o jsonpath='{.status.completionTime}' 2>/dev/null)
+
+          # Duration
+          DUR="N/A"
+          if [ -n "$TSTART" ] && [ -n "$TCOMP" ]; then
+            S=$(date -d "$TSTART" +%s 2>/dev/null || echo 0)
+            C=$(date -d "$TCOMP" +%s 2>/dev/null || echo 0)
+            [ "$S" != "0" ] && [ "$C" != "0" ] && DUR="$((C - S))s"
+          fi
+
+          echo "  $TLABEL: $TSTATUS (exit=$TEXIT, ${DUR})"
+
+          TASKS_TABLE="${TASKS_TABLE}| $TLABEL | $TSTATUS | $TEXIT | $DUR |\n"
+
+          # If FAILED — collect deep info
+          if [ "$TSTATUS" = "Failed" ] || echo "$TSTATUS" | grep -qi "fail"; then
+            FAILED_TASK="$TLABEL"
+            FAILED_EXIT="$TEXIT"
+
+            POD=$(kubectl get pods -n "$NS" \
+              -l "tekton.dev/taskRun=$TASKRUN" \
+              -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
+
+            if [ -n "$POD" ]; then
+              echo "    → Pod: $POD — collecting logs + resources + events..."
+
+              FAILED_LOGS=$(kubectl logs "$POD" -n "$NS" --all-containers --tail="$LOG_LINES" 2>/dev/null || echo "logs unavailable")
+
+              FAILED_RESOURCES=$(kubectl get pod "$POD" -n "$NS" \
+                -o jsonpath='{range .spec.containers[*]}container={.name} cpu-req={.resources.requests.cpu} cpu-lim={.resources.limits.cpu} mem-req={.resources.requests.memory} mem-lim={.resources.limits.memory}{"\n"}{end}' 2>/dev/null || echo "unavailable")
+
+              FAILED_POD_STATUS=$(kubectl get pod "$POD" -n "$NS" \
+                -o jsonpath='{range .status.containerStatuses[*]}{.name}: reason={.state.terminated.reason} exit={.state.terminated.exitCode}{"\n"}{end}' 2>/dev/null || echo "N/A")
+
+              FAILED_EVENTS=$(kubectl get events -n "$NS" \
+                --field-selector "involvedObject.name=$POD" \
+                -o custom-columns="TYPE:.type,REASON:.reason,MSG:.message" \
+                --no-headers 2>/dev/null | tail -10 || echo "no events")
+            fi
+          fi
+        done <<< "$TASKRUN_NAMES"
+
+        echo ""
+
+        # ═══════════════════════════════════════════════════════════
+        # 2. CLASSIFY — determine failure category
+        # ═══════════════════════════════════════════════════════════
+        echo "=== [2/4] Classifying Failure ==="
+
+        CATEGORY="none"
+
+        if [ "$AGG_STATUS" = "Succeeded" ]; then
+          CATEGORY="none"
+        elif [ -n "$FAILED_LOGS" ]; then
+          if [ "$FAILED_EXIT" = "137" ] || echo "$FAILED_LOGS $FAILED_POD_STATUS" | grep -qi "OOMKilled\|out of memory\|Cannot allocate"; then
+            CATEGORY="oom"
+          elif [ "$FAILED_EXIT" = "124" ] || echo "$FAILED_LOGS" | grep -qi "timed out\|deadline exceeded\|context deadline"; then
+            CATEGORY="timeout"
+          elif echo "$FAILED_LOGS $FAILED_EVENTS" | grep -qi "exceeded quota\|forbidden.*quota\|insufficient cpu\|insufficient memory"; then
+            CATEGORY="resource-quota"
+          elif echo "$FAILED_LOGS" | grep -qi "unauthorized\|forbidden\|access denied\|401 \|403 \|authentication required\|token expired"; then
+            CATEGORY="auth"
+          elif echo "$FAILED_LOGS" | grep -qi "connection refused\|unreachable\|no route\|ENETUNREACH\|dial tcp\|i/o timeout\|TLS handshake"; then
+            CATEGORY="infra"
+          elif echo "$FAILED_LOGS $FAILED_EVENTS" | grep -qi "ImagePullBackOff\|ErrImagePull\|manifest unknown\|pull access denied"; then
+            CATEGORY="image-pull"
+          elif echo "$FAILED_LOGS" | grep -qi "FAIL.*test\|test.*failed\|assertion.*error\|expected.*got"; then
+            CATEGORY="test-failure"
+          elif echo "$FAILED_LOGS" | grep -qi "build.*fail\|compile.*error\|syntax error\|cannot find\|404 Not Found\|go mod\|npm ERR\|pip.*error\|maven.*ERROR"; then
+            CATEGORY="build-error"
+          else
+            CATEGORY="unknown"
+          fi
+        elif [ -n "$FAILED_TASK" ]; then
+          CATEGORY="unknown"
+        fi
+
+        echo "→ Category: $CATEGORY"
+        echo ""
+
+        # ═══════════════════════════════════════════════════════════
+        # 3. REMEDIATION — generate fix advice
+        # ═══════════════════════════════════════════════════════════
+        echo "=== [3/4] Generating Remediation ==="
+
+        case "$CATEGORY" in
+          oom)
+            REMEDIATION="MEMORY ISSUE (OOM-Kill, exit 137)
+        Task '${FAILED_TASK}' exceeded its memory limit.
+        FIX: Increase memory — add to PipelineRun:
+          taskRunSpecs:
+            - pipelineTaskName: ${FAILED_TASK}
+              computeResources:
+                requests: { memory: 4Gi }
+                limits:   { memory: 8Gi }
+        INVESTIGATE:
+          - Check for memory leaks in the build
+          - For Go: set GOGC=50 or GOMEMLIMIT
+          - For Java: set -Xmx in MAVEN_OPTS
+          - Consider multi-stage build to reduce peak memory" ;;
+          timeout)
+            REMEDIATION="TIMEOUT (exit 124)
+        Task '${FAILED_TASK}' exceeded its deadline.
+        FIX: Increase timeout in PipelineRun spec:
+          timeouts:
+            tasks: 2h0m0s
+            pipeline: 3h0m0s
+        INVESTIGATE:
+          - Slow dependency downloads -> use a mirror/cache
+          - Step hanging -> check for interactive prompts
+          - Network throttling -> check egress limits" ;;
+          auth)
+            REMEDIATION="AUTHENTICATION FAILURE
+        Task '${FAILED_TASK}' failed due to invalid/missing credentials.
+        FIX:
+          1. Check push secret: kubectl get secret -n $NS
+          2. Check token expiration on registry robot account
+          3. Ensure SA has imagePullSecrets
+          4. Recreate: kubectl create secret docker-registry ..." ;;
+          infra)
+            REMEDIATION="INFRASTRUCTURE / NETWORK ERROR
+        Task '${FAILED_TASK}' cannot reach an external service.
+        FIX:
+          1. Check registry/git status page
+          2. Test DNS: kubectl run tmp --rm -i --image=busybox -- nslookup <host>
+          3. Check firewall/egress rules
+          4. Retry — may be transient" ;;
+          resource-quota)
+            REMEDIATION="RESOURCE QUOTA EXCEEDED
+        Namespace limits reached.
+        FIX:
+          1. Check: kubectl describe resourcequota -n $NS
+          2. Wait for other runs to finish
+          3. Request quota increase
+          4. Lower resource requests" ;;
+          image-pull)
+            REMEDIATION="IMAGE PULL ERROR
+        A task image could not be pulled.
+        FIX:
+          1. Verify image reference (typo in tag?)
+          2. Check if image exists: skopeo inspect docker://<image>
+          3. Ensure imagePullSecrets configured
+          4. Image may have been garbage collected" ;;
+          test-failure)
+            REMEDIATION="TEST FAILURE
+        Tests failed in '${FAILED_TASK}'.
+        FIX:
+          1. Review test output in logs
+          2. Run tests locally to reproduce
+          3. Check for flaky tests
+          4. Check test dependency changes" ;;
+          build-error)
+            REMEDIATION="BUILD / COMPILATION ERROR
+        Source code or dependency issue in '${FAILED_TASK}'.
+        FIX:
+          1. Read compiler error in logs
+          2. Check if dependency deleted/changed
+          3. Build locally: podman build -f Dockerfile .
+          4. Verify go.mod / package.json / requirements.txt" ;;
+          config)
+            REMEDIATION="CONFIGURATION ERROR
+        Missing file, parameter, or invalid config.
+        FIX:
+          1. Verify all pipeline parameters provided
+          2. Check workspace volume mounts
+          3. Check for YAML syntax errors" ;;
+          none)
+            REMEDIATION="Pipeline succeeded. No remediation needed." ;;
+          *)
+            REMEDIATION="UNCLASSIFIED FAILURE
+        Could not auto-classify.
+        NEXT STEPS:
+          1. Review full logs
+          2. kubectl describe pod <pod> -n $NS
+          3. Share this report with support" ;;
+        esac
+
+        echo "$REMEDIATION"
+        echo ""
+
+        # ═══════════════════════════════════════════════════════════
+        # 4. BUILD REPORT + WRITE RESULTS
+        # ═══════════════════════════════════════════════════════════
+        echo "=== [4/4] Building Report & Writing Results ==="
+
+        # ── Annotate PipelineRun (visible in Tekton Dashboard) ──
+        kubectl annotate pipelinerun "$PR_NAME" -n "$NS" --overwrite \
+          "failure-analyzer.tekton.dev/category=$CATEGORY" \
+          "failure-analyzer.tekton.dev/failed-task=${FAILED_TASK:-none}" \
+          "failure-analyzer.tekton.dev/exit-code=${FAILED_EXIT:-N/A}" \
+          "failure-analyzer.tekton.dev/analyzed-at=$NOW" \
+          2>/dev/null && echo "✓ PipelineRun annotated" || echo "⚠ Could not annotate (check RBAC)"
+
+        # ── Build the structured report ──
+        {
+          echo "# Pipeline Failure Analysis Report"
+          echo ""
+          echo "| Field | Value |"
+          echo "|-------|-------|"
+          echo "| PipelineRun | $PR_NAME |"
+          echo "| Pipeline | ${PL_NAME:-N/A} |"
+          echo "| Namespace | $NS |"
+          echo "| Status | $AGG_STATUS |"
+          echo "| Failure Category | $CATEGORY |"
+          echo "| Failed Task | ${FAILED_TASK:-none} |"
+          echo "| Exit Code | ${FAILED_EXIT:-N/A} |"
+          echo "| Analyzed At | $NOW |"
+          echo ""
+          echo "## Task Summary"
+          echo "| Task | Status | Exit | Duration |"
+          echo "|------|--------|------|----------|"
+          echo -e "$TASKS_TABLE"
+          echo ""
+          echo "## Resources (Failed Pod)"
+          echo "${FAILED_RESOURCES:-N/A}"
+          echo ""
+          echo "## Container Status"
+          echo "${FAILED_POD_STATUS:-N/A}"
+          echo ""
+          echo "## Pod Events"
+          echo "${FAILED_EVENTS:-None}"
+          echo ""
+          echo "## Logs (last $LOG_LINES lines)"
+          echo "$FAILED_LOGS"
+          echo ""
+          echo "## Remediation"
+          echo "$REMEDIATION"
+          echo ""
+          echo "---"
+          echo "Generated by Smart Failure Analyzer v2.0"
+        } > "$SHARE/report.md"
+
+        # ── Write Tekton results (keep small — full report is in logs + annotations) ──
+        printf '%s' "$CATEGORY" > "$RESULT_CATEGORY"
+        printf '%s' "${FAILED_TASK:-none}" > "$RESULT_FAILED_TASK"
+        printf '%s' "[$CATEGORY] Task '${FAILED_TASK:-none}' failed with exit $FAILED_EXIT in pipeline $PR_NAME ($NS)" > "$RESULT_SUMMARY"
+
+        # Also save for the LLM/Slack step
+        printf '%s' "$CATEGORY" > "$SHARE/category.txt"
+        printf '%s' "${FAILED_TASK:-none}" > "$SHARE/failed-task.txt"
+        printf '%s' "$REMEDIATION" > "$SHARE/remediation.txt"
+
+        echo ""
+        echo "✓ Report generated ($(wc -c < "$SHARE/report.md") bytes)"
+        echo "✓ Results written to Tekton"
+        echo ""
+
+        # Print full report to stdout (visible in Dashboard logs)
+        echo "════════════════════════════════════════════════════════════════"
+        echo "                    FULL ANALYSIS REPORT"
+        echo "════════════════════════════════════════════════════════════════"
+        cat "$SHARE/report.md"
+        echo "════════════════════════════════════════════════════════════════"
+
+    # ════════════════════════════════════════════════════════════════
+    # STEP 2: LLM ANALYSIS + SLACK (optional — both skipped if not configured)
+    # ════════════════════════════════════════════════════════════════
+    - name: llm-and-notify
+      image: alpine:3.19
+      env:
+        - name: LLM_ENDPOINT
+          value: "$(params.LLM_ENDPOINT)"
+        - name: LLM_MODEL
+          value: "$(params.LLM_MODEL)"
+        - name: SLACK_CHANNEL
+          value: "$(params.SLACK_CHANNEL)"
+        - name: PR_NAME
+          value: "$(params.PIPELINE_RUN_NAME)"
+        - name: NS
+          value: "$(params.NAMESPACE)"
+      script: |
+        #!/bin/sh
+        set -uo pipefail
+
+        SHARE="/workspace/share"
+        CATEGORY=$(cat "$SHARE/category.txt" 2>/dev/null || echo "unknown")
+        FAILED_TASK=$(cat "$SHARE/failed-task.txt" 2>/dev/null || echo "none")
+        REPORT=$(cat "$SHARE/report.md" 2>/dev/null || echo "")
+        REMEDIATION=$(cat "$SHARE/remediation.txt" 2>/dev/null || echo "")
+
+        # ────────────────────────────────────────────────
+        # LLM ANALYSIS (OpenAI-compatible API)
+        # ────────────────────────────────────────────────
+        # Reads API key from mounted K8s secret: smart-analyzer-llm
+        API_KEY=$(cat /var/run/secrets/llm/api-key 2>/dev/null || echo "")
+
+        if [ -n "$LLM_ENDPOINT" ] && [ -n "$API_KEY" ]; then
+          echo "╔══════════════════════════════════════════════════╗"
+          echo "║  LLM Analysis                                    ║"
+          echo "╚══════════════════════════════════════════════════╝"
+          echo "  Endpoint: $LLM_ENDPOINT"
+          echo "  Model:    $LLM_MODEL"
+          echo ""
+
+          apk add --no-cache curl jq >/dev/null 2>&1
+
+          # Build the prompt — include the full structured report
+          PROMPT="You are a CI/CD pipeline failure expert. Analyze this pipeline failure report.
+
+        Your response MUST include:
+        1. ROOT CAUSE: What exactly caused the failure
+        2. CLASSIFICATION CHECK: Confirm or correct the automated classification ($CATEGORY)
+        3. IMMEDIATE FIX: Step-by-step commands/actions to resolve this specific failure
+        4. PREVENTION: How to prevent this in future pipelines
+        5. SIMILAR ISSUES: Common related problems to watch for
+
+        Be concise, specific, and actionable. Use bullet points.
+
+        --- FAILURE REPORT ---
+        $REPORT
+        --- END REPORT ---"
+
+          PAYLOAD=$(printf '%s' "$PROMPT" | jq -Rs --arg model "$LLM_MODEL" '{
+            model: $model,
+            max_tokens: 1024,
+            temperature: 0.2,
+            messages: [
+              {role: "system", content: "You are a senior SRE and CI/CD pipeline expert at a large enterprise. You analyze Tekton pipeline failures and provide precise, actionable remediation. Always include specific kubectl commands when relevant."},
+              {role: "user", content: .}
+            ]
+          }')
+
+          echo "  Calling LLM..."
+          RESPONSE=$(curl -s -m 120 \
+            -H "Content-Type: application/json" \
+            -H "Authorization: Bearer $API_KEY" \
+            -d "$PAYLOAD" \
+            "$LLM_ENDPOINT" 2>&1)
+
+          # Parse response — handle both OpenAI and compatible APIs
+          if echo "$RESPONSE" | grep -q '"choices"'; then
+            LLM_TEXT=$(echo "$RESPONSE" | jq -r '.choices[0].message.content // "No content in response"' 2>/dev/null)
+            echo ""
+            echo "  ✓ LLM Response received!"
+            echo ""
+            echo "── AI Analysis ──────────────────────────────────"
+            echo "$LLM_TEXT"
+            echo "─────────────────────────────────────────────────"
+            echo "$LLM_TEXT" > "$SHARE/llm-response.txt"
+          else
+            ERROR=$(echo "$RESPONSE" | jq -r '.error.message // .error // "Unknown error"' 2>/dev/null || echo "$RESPONSE")
+            echo "  ⚠ LLM Error: $ERROR"
+            echo "LLM Error: $ERROR" > "$SHARE/llm-response.txt"
+          fi
+        elif [ -n "$LLM_ENDPOINT" ] && [ -z "$API_KEY" ]; then
+          echo "⚠ LLM endpoint configured but API key missing!"
+          echo "  Create the secret:"
+          echo "    kubectl create secret generic smart-analyzer-llm --from-literal=api-key=sk-YOUR-KEY"
+          echo "LLM skipped: API key not found" > "$SHARE/llm-response.txt"
+        else
+          echo "ℹ LLM: not configured (set LLM_ENDPOINT param to enable)"
+          echo "" > "$SHARE/llm-response.txt"
+        fi
+
+        echo ""
+
+        # ────────────────────────────────────────────────
+        # SLACK NOTIFICATION
+        # ────────────────────────────────────────────────
+        # Reads webhook URL from mounted K8s secret: smart-analyzer-slack
+        SLACK_WEBHOOK_URL=$(cat /var/run/secrets/slack/webhook-url 2>/dev/null || echo "")
+
+        if [ -n "$SLACK_WEBHOOK_URL" ]; then
+          echo "╔══════════════════════════════════════════════════╗"
+          echo "║  Slack Notification                              ║"
+          echo "╚══════════════════════════════════════════════════╝"
+
+          command -v curl >/dev/null 2>&1 || apk add --no-cache curl jq >/dev/null 2>&1
+
+          # Choose emoji + color based on category
+          case "$CATEGORY" in
+            none)           EMOJI="✅"; COLOR="#36a64f" ;;
+            oom)            EMOJI="💥"; COLOR="#ff0000" ;;
+            timeout)        EMOJI="⏰"; COLOR="#ff8c00" ;;
+            auth)           EMOJI="🔑"; COLOR="#ff4500" ;;
+            build-error)    EMOJI="🔨"; COLOR="#dc143c" ;;
+            infra)          EMOJI="🌐"; COLOR="#ff6347" ;;
+            resource-quota) EMOJI="📊"; COLOR="#ff8c00" ;;
+            test-failure)   EMOJI="🧪"; COLOR="#ff4500" ;;
+            image-pull)     EMOJI="🐳"; COLOR="#ff6347" ;;
+            *)              EMOJI="❓"; COLOR="#808080" ;;
+          esac
+
+          # Build rich Slack message with blocks
+          LLM_TEXT=$(cat "$SHARE/llm-response.txt" 2>/dev/null || echo "")
+
+          # Escape special chars for JSON
+          ESC_REMEDIATION=$(echo "$REMEDIATION" | head -10 | sed 's/\\/\\\\/g; s/"/\\"/g; s/\t/  /g' | tr '\n' '|' | sed 's/|/\\n/g')
+          ESC_LLM=""
+          if [ -n "$LLM_TEXT" ] && [ "$LLM_TEXT" != "LLM skipped: API key not found" ] && [ -n "$LLM_TEXT" ]; then
+            ESC_LLM=$(echo "$LLM_TEXT" | head -10 | sed 's/\\/\\\\/g; s/"/\\"/g; s/\t/  /g' | tr '\n' '|' | sed 's/|/\\n/g')
+          fi
+
+          # Build payload — use Slack Block Kit for rich formatting
+          CHANNEL_FIELD=""
+          [ -n "$SLACK_CHANNEL" ] && CHANNEL_FIELD="\"channel\": \"$SLACK_CHANNEL\","
+
+          PAYLOAD=$(cat <<EOFSLACK
+        {
+          $CHANNEL_FIELD
+          "attachments": [
+            {
+              "color": "$COLOR",
+              "blocks": [
+                {
+                  "type": "header",
+                  "text": { "type": "plain_text", "text": "$EMOJI Pipeline Failure: $CATEGORY", "emoji": true }
+                },
+                {
+                  "type": "section",
+                  "fields": [
+                    { "type": "mrkdwn", "text": "*PipelineRun:*\n\`$PR_NAME\`" },
+                    { "type": "mrkdwn", "text": "*Namespace:*\n\`$NS\`" },
+                    { "type": "mrkdwn", "text": "*Failed Task:*\n\`$FAILED_TASK\`" },
+                    { "type": "mrkdwn", "text": "*Category:*\n\`$CATEGORY\`" }
+                  ]
+                },
+                {
+                  "type": "section",
+                  "text": { "type": "mrkdwn", "text": "*Remediation:*\n$ESC_REMEDIATION" }
+                }
+              ]
+            }
+          ]
+        }
+        EOFSLACK
+          )
+
+          # Add AI section if available
+          if [ -n "$ESC_LLM" ]; then
+            PAYLOAD=$(echo "$PAYLOAD" | jq --arg llm "$ESC_LLM" '.attachments[0].blocks += [{"type": "divider"}, {"type": "section", "text": {"type": "mrkdwn", "text": ("*🤖 AI Analysis:*\n" + $llm)}}]')
+          fi
+
+          # Add footer
+          PAYLOAD=$(echo "$PAYLOAD" | jq '.attachments[0].blocks += [{"type": "context", "elements": [{"type": "mrkdwn", "text": "Smart Failure Analyzer v2.0 | <http://localhost:9097|Tekton Dashboard>"}]}]')
+
+          HTTP=$(curl -s -o /tmp/slack-response.txt -w "%{http_code}" \
+            -H "Content-Type: application/json" \
+            -d "$PAYLOAD" "$SLACK_WEBHOOK_URL")
+
+          if [ "$HTTP" = "200" ]; then
+            echo "  ✓ Slack notification sent!"
+          else
+            echo "  ⚠ Slack returned HTTP $HTTP"
+            cat /tmp/slack-response.txt 2>/dev/null
+          fi
+        else
+          echo "ℹ Slack: not configured"
+          echo "  Create the secret:"
+          echo "    kubectl create secret generic smart-analyzer-slack --from-literal=webhook-url=https://hooks.slack.com/services/YOUR/WEBHOOK/URL"
+        fi
+
+        echo ""
+        echo "════════════════════════════════════════════════════"
+        echo "  Smart Failure Analyzer v2.0 — Complete"
+        echo "════════════════════════════════════════════════════"
+
+  stepTemplate:
+    volumeMounts:
+      - name: shared
+        mountPath: /workspace/share
+      - name: llm-secret
+        mountPath: /var/run/secrets/llm
+        readOnly: true
+      - name: slack-secret
+        mountPath: /var/run/secrets/slack
+        readOnly: true
+  volumes:
+    - name: shared
+      emptyDir: {}
+    - name: llm-secret
+      secret:
+        secretName: "$(params.LLM_API_KEY_SECRET_NAME)"
+        optional: true
+    - name: slack-secret
+      secret:
+        secretName: "$(params.SLACK_WEBHOOK_SECRET_NAME)"
+        optional: true
