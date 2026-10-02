@@ -1,0 +1,3 @@
+#!/usr/bin/env bash
+# Mock select-oci-auth executable for Tekton task tests.
+echo '{"auths":{}}'
